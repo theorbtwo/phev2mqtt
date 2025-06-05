@@ -23,6 +23,7 @@ import (
 	"github.com/buxtronix/phev2mqtt/client"
 	"github.com/buxtronix/phev2mqtt/protocol"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"os/exec"
 	"strings"
 	"time"
@@ -43,6 +44,7 @@ Status data from the car is passed to the MQTT topics, and also some commands fr
 are sent to control certain aspects of the car. See the phev2mqtt Github page for
 more details on the topics.
 `,
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mc := &mqttClient{climate: new(climate)}
 		return mc.Run(cmd, args)
@@ -103,10 +105,8 @@ func (c *climate) mqttStates() map[string]string {
 var lastWifiRestart time.Time
 
 func restartWifi(cmd *cobra.Command) error {
-	restartRetryTime, err := cmd.Flags().GetDuration("wifi_restart_retry_time")
-	if err != nil {
-		return err
-	}
+	restartRetryTime := viper.GetDuration("wifi_restart_retry_time")
+
 	if time.Now().Sub(lastWifiRestart) < restartRetryTime {
 		return nil
 	}
@@ -114,18 +114,20 @@ func restartWifi(cmd *cobra.Command) error {
 		lastWifiRestart = time.Now()
 	}()
 
-	restartCommand, _ := cmd.Flags().GetString("wifi_restart_command")
+	restartCommand := viper.GetString("wifi_restart_command")
 	if restartCommand == "" {
 		log.Debugf("wifi restart disabled")
 		return nil
 	}
 
-	log.Infof("Attempting to restart wifi")
+	log.Debugf("Attempting to restart wifi")
 
-	restartCmd := exec.Command("sh", "-c", restartCommand)
+	restartCmd := exec.Command("/bin/sh", "-c", restartCommand)
 
 	stdoutStderr, err := restartCmd.CombinedOutput()
-	log.Infof("Output from wifi restart: %s", stdoutStderr)
+	if len( stdoutStderr ) > 0 {
+		log.Infof("Output from wifi restart: %s", stdoutStderr)
+	}
 	return err
 }
 
@@ -137,12 +139,13 @@ type mqttClient struct {
 
 	phev        *client.Client
 	lastConnect time.Time
-	everPublishedBatteryLevel bool
+	lastError   error
 
 	prefix string
 
-	haDiscovery       bool
-	haDiscoveryPrefix string
+	haDiscovery		bool
+	haDiscoveryPrefix	string
+	haPublishedDiscovery	bool
 
 	climate *climate
 	enabled bool
@@ -153,24 +156,25 @@ func (m *mqttClient) topic(topic string) string {
 }
 
 func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
-	var err error
-
 	m.enabled = true // Default.
-	mqttServer, _ := cmd.Flags().GetString("mqtt_server")
-	mqttUsername, _ := cmd.Flags().GetString("mqtt_username")
-	mqttPassword, _ := cmd.Flags().GetString("mqtt_password")
-	m.prefix, _ = cmd.Flags().GetString("mqtt_topic_prefix")
-	m.haDiscovery, _ = cmd.Flags().GetBool("ha_discovery")
-	m.haDiscoveryPrefix, _ = cmd.Flags().GetString("ha_discovery_prefix")
 
-	m.updateInterval, err = cmd.Flags().GetDuration("update_interval")
-	if err != nil {
-		return err
+	mqttServer		:= viper.GetString("mqtt_server")
+	mqttUsername		:= viper.GetString("mqtt_username")
+	mqttPassword		:= viper.GetString("mqtt_password")
+	mqttDisableSet		:= viper.GetBool("mqtt_disable_register_set_command")
+	m.prefix		 = viper.GetString("mqtt_topic_prefix")
+	m.haDiscovery		 = viper.GetBool("ha_discovery")
+	m.haDiscoveryPrefix	 = viper.GetString("ha_discovery_prefix")
+	m.updateInterval	 = viper.GetDuration("update_interval")
+	wifiRestartTime		:= viper.GetDuration("wifi_restart_time")
+	restartCommand		:= viper.GetString("wifi_restart_command")
+
+	if restartCommand == "" {
+		log.Infof("WiFi restart disabled")
 	}
-	wifiRestartTime, err := cmd.Flags().GetDuration("wifi_restart_time")
-	if err != nil {
-		return err
-	}
+
+	m.haPublishedDiscovery	= false
+	m.lastError		= nil
 
 	m.options = mqtt.NewClientOptions().
 		AddBroker(mqttServer).
@@ -186,8 +190,12 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 		return token.Error()
 	}
 
-	if token := m.client.Subscribe(m.topic("/set/#"), 0, nil); token.Wait() && token.Error() != nil {
-		return token.Error()
+	if !mqttDisableSet {
+		if token := m.client.Subscribe(m.topic("/set/#"), 0, nil); token.Wait() && token.Error() != nil {
+			return token.Error()
+		}
+	} else {
+		log.Info("Setting vechicle registers via MQTT is disabled")
 	}
 	if token := m.client.Subscribe(m.topic("/connection"), 0, nil); token.Wait() && token.Error() != nil {
 		return token.Error()
@@ -201,7 +209,11 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 	for {
 		if m.enabled {
 			if err := m.handlePhev(cmd); err != nil {
-				log.Error(err)
+				// Do not flood the log with the same messages every second
+				if m.lastError == nil || m.lastError.Error() != err.Error() {
+					log.Error(err)
+					m.lastError = err
+				}
 			}
 			// Publish as offline if last connection was >30s ago.
 			if time.Now().Sub(m.lastConnect) > 30*time.Second {
@@ -220,10 +232,10 @@ func (m *mqttClient) Run(cmd *cobra.Command, args []string) error {
 }
 
 func (m *mqttClient) publish(topic, payload string) {
-	if cache := m.mqttData[topic]; cache != payload {
+//	if cache := m.mqttData[topic]; cache != payload {
 		m.client.Publish(m.topic(topic), 0, false, payload)
 		m.mqttData[topic] = payload
-	}
+//	}
 }
 
 func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Message) {
@@ -341,7 +353,7 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 				log.Infof("Error setting AC enabled state: %v", err)
 				return
 			}
-		} else if m.phev.ModelYear == client.ModelYear18 {
+		} else if m.phev.ModelYear == client.ModelYear18 || m.phev.ModelYear == client.ModelYear24 {
 			state := byte(0x02)
 			if mode == 0x0 {
 				state = 0x1
@@ -362,7 +374,7 @@ func (m *mqttClient) handleIncomingMqtt(mqtt_client mqtt.Client, msg mqtt.Messag
 
 func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
 	var err error
-	address, _ := cmd.Flags().GetString("address")
+	address := viper.GetString("address")
 	m.phev, err = client.New(client.AddressOption(address))
 	if err != nil {
 		return err
@@ -376,7 +388,9 @@ func (m *mqttClient) handlePhev(cmd *cobra.Command) error {
 		return err
 	}
 	m.client.Publish(m.topic("/available"), 0, true, "online")
-	m.everPublishedBatteryLevel = false
+
+	m.lastError = nil
+
 	defer func() {
 		m.lastConnect = time.Now()
 	}()
@@ -455,7 +469,15 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 		}
 	case *protocol.RegisterChargeStatus:
 		m.publish("/charge/charging", boolOnOff[reg.Charging])
-		m.publish("/charge/remaining", fmt.Sprintf("%d", reg.Remaining))
+		if reg.Remaining < 1000 {
+			m.publish("/charge/remaining", fmt.Sprintf("%d", reg.Remaining))
+		} else {
+			log.Debugf("Ignoring charge remanining reading: %v", reg.Remaining)
+			if cache := m.mqttData["/charge/remaining"]; cache != "" {
+				m.publish("/charge/remaining", cache)
+				log.Debugf("Publishing last best known charge remaining reading: %v", cache)
+			}
+		}
 	case *protocol.RegisterDoorStatus:
 		m.publish("/door/locked", boolOpen[!reg.Locked])
 		m.publish("/door/rear_left", boolOpen[reg.RearLeft])
@@ -468,11 +490,13 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 		m.publish("/door/boot", boolOpen[reg.Boot])
 		m.publish("/lights/head", boolOnOff[reg.Headlights])
 	case *protocol.RegisterBatteryLevel:
-		if !m.everPublishedBatteryLevel || reg.Level > 5 {
-			m.everPublishedBatteryLevel = true
+		if (reg.Level > 5) && (reg.Level < 255) {
 			m.publish("/battery/level", fmt.Sprintf("%d", reg.Level))
 		} else {
-			log.Debugf("Ignoring battery level reading: %v", reg.Level)
+			if cache := m.mqttData["/battery/level"]; cache != "" {
+				m.publish("/battery/level", cache )
+				log.Debugf("Ignoring battery level reading: %v, publishing last best known: %v", reg.Level, cache)
+			}
 		}
 		m.publish("/lights/parking", boolOnOff[reg.ParkingLights])
 	case *protocol.RegisterLightStatus:
@@ -489,14 +513,12 @@ func (m *mqttClient) publishRegister(msg *protocol.PhevMessage) {
 
 // Publish home assistant discovery message.
 // Uses the vehicle VIN, so sent after VIN discovery.
-var publishedDiscovery = false
-
 func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 
-	if publishedDiscovery || !m.haDiscovery {
+	if m.haPublishedDiscovery || !m.haDiscovery {
 		return
 	}
-	publishedDiscovery = true
+	m.haPublishedDiscovery = true
 	discoveryData := map[string]string{
 		// Doors.
 		"%s/binary_sensor/%s_door_locked/config": `{
@@ -799,7 +821,9 @@ func (m *mqttClient) publishHomeAssistantDiscovery(vin, topic, name string) {
 		for in, out := range mappings {
 			d = strings.Replace(d, in, out, -1)
 		}
-		m.client.Publish(topic, 0, false, d)
+		if token := m.client.Publish(topic, 0, true, d); token.Wait() && token.Error() != nil {
+			log.Error( token.Error() )
+		}
 		//m.client.Publish(topic, 0, false, "{}")
 	}
 }
@@ -820,10 +844,23 @@ func init() {
 	mqttCmd.Flags().String("mqtt_username", "", "Username to login to MQTT server")
 	mqttCmd.Flags().String("mqtt_password", "", "Password to login to MQTT server")
 	mqttCmd.Flags().String("mqtt_topic_prefix", "phev", "Prefix for MQTT topics")
+	mqttCmd.Flags().Bool("mqtt_disable_register_set_command", false, "Disable vechicle register setting via MQTT")
 	mqttCmd.Flags().Bool("ha_discovery", true, "Enable Home Assistant MQTT discovery")
 	mqttCmd.Flags().String("ha_discovery_prefix", "homeassistant", "Prefix for Home Assistant MQTT discovery")
 	mqttCmd.Flags().Duration("update_interval", 5*time.Minute, "How often to request force updates")
 	mqttCmd.Flags().Duration("wifi_restart_time", 0, "Attempt to restart Wifi if no connection for this long")
 	mqttCmd.Flags().Duration("wifi_restart_retry_time", 2*time.Minute, "Interval to attempt Wifi restart")
 	mqttCmd.Flags().String("wifi_restart_command", defaultWifiRestartCmd, "Command to restart Wifi connection to Phev")
+
+	viper.BindPFlag("mqtt_server", mqttCmd.Flags().Lookup("mqtt_server"))
+	viper.BindPFlag("mqtt_username", mqttCmd.Flags().Lookup("mqtt_username"))
+	viper.BindPFlag("mqtt_password", mqttCmd.Flags().Lookup("mqtt_password"))
+	viper.BindPFlag("mqtt_topic_prefix", mqttCmd.Flags().Lookup("mqtt_topic_prefix"))
+	viper.BindPFlag("mqtt_disable_register_set_command", mqttCmd.Flags().Lookup("mqtt_disable_register_set_command"))
+	viper.BindPFlag("ha_discovery", mqttCmd.Flags().Lookup("ha_discovery"))
+	viper.BindPFlag("ha_discovery_prefix", mqttCmd.Flags().Lookup("ha_discovery_prefix"))
+	viper.BindPFlag("update_interval", mqttCmd.Flags().Lookup("update_interval"))
+	viper.BindPFlag("wifi_restart_time", mqttCmd.Flags().Lookup("wifi_restart_time"))
+	viper.BindPFlag("wifi_restart_retry_time", mqttCmd.Flags().Lookup("wifi_restart_retry_time"))
+	viper.BindPFlag("wifi_restart_command", mqttCmd.Flags().Lookup("wifi_restart_command"))
 }
